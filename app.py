@@ -1,25 +1,35 @@
 import os
 import re
 import io
+import tempfile
+from datetime import date
+
 import pandas as pd
 import streamlit as st
-from datetime import date
+import requests
+from PIL import Image, ImageDraw, ImageFont
+
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.units import mm
 from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.pdfbase import pdfmetrics
-from reportlab.pdfbase.ttfonts import TTFont
+from reportlab.pdfbase.cidfonts import UnicodeCIDFont
 
 st.set_page_config(page_title="카페 발주 리스트", page_icon="☕", layout="wide")
 
+# ===== 구글시트 설정 =====
 SHEET_ID = "1HztR9CkmD2Y_URULXA9IK7DM8MHv57UWOEaej13N53A"
 SHEET_GID = "0"
 SHEET_CSV_URL = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/export?format=csv&gid={SHEET_GID}"
 
+# ===== 비밀번호 설정 =====
 DEFAULT_PASSWORD = "1234"
 APP_PASSWORD = st.secrets.get("APP_PASSWORD", DEFAULT_PASSWORD)
+
+# 이미지 생성용 한글 폰트: 서버 실행 시 임시 다운로드
+FONT_URL = "https://github.com/googlefonts/noto-cjk/raw/main/Sans/OTF/Korean/NotoSansCJKkr-Regular.otf"
 
 if "login_ok" not in st.session_state:
     st.session_state.login_ok = False
@@ -35,25 +45,24 @@ if not st.session_state.login_ok:
             st.error("비밀번호가 맞지 않습니다.")
     st.stop()
 
-def register_korean_font():
-    font_candidates = [
-        "C:/Windows/Fonts/malgun.ttf",
-        "C:/Windows/Fonts/malgunbd.ttf",
-        "/System/Library/Fonts/AppleSDGothicNeo.ttc",
-        "/Library/Fonts/AppleGothic.ttf",
-        "/usr/share/fonts/truetype/nanum/NanumGothic.ttf",
-        "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
-    ]
-    for path in font_candidates:
-        if os.path.exists(path):
-            try:
-                pdfmetrics.registerFont(TTFont("KoreanFont", path))
-                return "KoreanFont"
-            except Exception:
-                pass
-    return "Helvetica"
+@st.cache_resource
+def get_korean_font_path():
+    font_path = os.path.join(tempfile.gettempdir(), "NotoSansCJKkr-Regular.otf")
+    if not os.path.exists(font_path):
+        r = requests.get(FONT_URL, timeout=20)
+        r.raise_for_status()
+        with open(font_path, "wb") as f:
+            f.write(r.content)
+    return font_path
 
-PDF_FONT = register_korean_font()
+@st.cache_resource
+def setup_pdf_font():
+    # ReportLab 기본 내장 CID 폰트라 클라우드에서도 한글 PDF 깨짐 방지
+    pdfmetrics.registerFont(UnicodeCIDFont("HYSMyeongJo-Medium"))
+    pdfmetrics.registerFont(UnicodeCIDFont("HYGothic-Medium"))
+    return "HYGothic-Medium"
+
+PDF_FONT = setup_pdf_font()
 
 def safe_filename(text):
     text = re.sub(r"[^\w가-힣.-]+", "_", str(text))
@@ -148,6 +157,113 @@ def make_pdf_bytes(order_date, staff_name, rows, memo):
     buffer.close()
     return pdf_value
 
+def build_kakao_text(order_date, staff_name, rows, memo):
+    lines = []
+    lines.append("☕ 카페 발주 리스트")
+    lines.append(f"발주일: {order_date}")
+    lines.append(f"작성자: {staff_name or '-'}")
+    lines.append("")
+
+    current_category = None
+    for r in rows:
+        if r["category"] != current_category:
+            current_category = r["category"]
+            lines.append(f"[{current_category}]")
+        note = f" / {r['note']}" if str(r["note"]).strip() else ""
+        lines.append(f"- {r['item']}: {r['qty']}{note}")
+    if memo:
+        lines.append("")
+        lines.append("[메모]")
+        lines.append(str(memo))
+    return "\n".join(lines)
+
+def text_size(draw, text, font):
+    bbox = draw.textbbox((0, 0), text, font=font)
+    return bbox[2] - bbox[0], bbox[3] - bbox[1]
+
+def wrap_text(draw, text, font, max_width):
+    words = list(str(text))
+    lines = []
+    current = ""
+    for ch in words:
+        test = current + ch
+        if text_size(draw, test, font)[0] <= max_width:
+            current = test
+        else:
+            if current:
+                lines.append(current)
+            current = ch
+    if current:
+        lines.append(current)
+    return lines
+
+def make_order_image_bytes(order_date, staff_name, rows, memo):
+    font_path = get_korean_font_path()
+
+    width = 1080
+    margin = 70
+    y = 70
+    bg = "white"
+    img = Image.new("RGB", (width, 1600), bg)
+    draw = ImageDraw.Draw(img)
+
+    font_title = ImageFont.truetype(font_path, 58)
+    font_header = ImageFont.truetype(font_path, 34)
+    font_body = ImageFont.truetype(font_path, 30)
+    font_small = ImageFont.truetype(font_path, 26)
+
+    def add_text(text, x, y, font, fill=(20, 20, 20), max_width=None, line_gap=12):
+        if max_width:
+            lines = wrap_text(draw, text, font, max_width)
+        else:
+            lines = [text]
+        for line in lines:
+            draw.text((x, y), line, font=font, fill=fill)
+            y += text_size(draw, line, font)[1] + line_gap
+        return y
+
+    y = add_text("☕ 카페 발주 리스트", margin, y, font_title)
+    y += 20
+    y = add_text(f"발주일: {order_date}", margin, y, font_small, fill=(80, 80, 80))
+    y = add_text(f"작성자: {staff_name or '-'}", margin, y, font_small, fill=(80, 80, 80))
+    y += 30
+
+    current_category = None
+    for r in rows:
+        if y > img.height - 220:
+            new_img = Image.new("RGB", (width, img.height + 900), bg)
+            new_img.paste(img, (0, 0))
+            img = new_img
+            draw = ImageDraw.Draw(img)
+
+        if r["category"] != current_category:
+            current_category = r["category"]
+            y += 18
+            draw.rounded_rectangle((margin, y, width - margin, y + 56), radius=16, fill=(242, 242, 242))
+            y = add_text(f"[{current_category}]", margin + 20, y + 11, font_header)
+            y += 8
+
+        note = f" / {r['note']}" if str(r["note"]).strip() else ""
+        item_line = f"• {r['item']}  {r['qty']}{note}"
+        y = add_text(item_line, margin + 18, y, font_body, max_width=width - margin * 2 - 36, line_gap=14)
+        y += 6
+
+    if memo:
+        y += 20
+        draw.rounded_rectangle((margin, y, width - margin, y + 56), radius=16, fill=(242, 242, 242))
+        y = add_text("[메모]", margin + 20, y + 11, font_header)
+        y += 8
+        y = add_text(str(memo), margin + 18, y, font_body, max_width=width - margin * 2 - 36)
+
+    y += 70
+    img = img.crop((0, 0, width, min(y, img.height)))
+
+    output = io.BytesIO()
+    img.save(output, format="PNG")
+    png_value = output.getvalue()
+    output.close()
+    return png_value
+
 st.title("☕ 카페 발주 리스트")
 st.caption("구글시트 품목표를 기준으로 불러옵니다. 품목 수정은 구글시트에서 하면 됩니다.")
 
@@ -215,15 +331,33 @@ if selected_rows:
     preview = pd.DataFrame(selected_rows)
     st.dataframe(preview, use_container_width=True, hide_index=True)
 
-    pdf_bytes = make_pdf_bytes(order_date, staff_name, selected_rows, memo)
-    file_name = f"발주리스트_{order_date}_{safe_filename(staff_name or '직원')}.pdf"
+    file_base = f"발주리스트_{order_date}_{safe_filename(staff_name or '직원')}"
 
-    st.download_button(
-        label="PDF 다운로드",
-        data=pdf_bytes,
-        file_name=file_name,
-        mime="application/pdf",
-        type="primary",
-    )
+    pdf_bytes = make_pdf_bytes(order_date, staff_name, selected_rows, memo)
+    img_bytes = make_order_image_bytes(order_date, staff_name, selected_rows, memo)
+    kakao_text = build_kakao_text(order_date, staff_name, selected_rows, memo)
+
+    st.subheader("공유용 이미지 미리보기")
+    st.image(img_bytes, use_container_width=True)
+
+    c1, c2 = st.columns(2)
+    with c1:
+        st.download_button(
+            label="이미지 PNG 다운로드",
+            data=img_bytes,
+            file_name=f"{file_base}.png",
+            mime="image/png",
+            type="primary",
+        )
+    with c2:
+        st.download_button(
+            label="PDF 다운로드",
+            data=pdf_bytes,
+            file_name=f"{file_base}.pdf",
+            mime="application/pdf",
+        )
+
+    st.caption("모바일에서는 PNG 다운로드 후 사진/파일에서 카카오톡 공유하면 됩니다.")
+    st.text_area("카카오톡 복사용 텍스트", kakao_text, height=220)
 else:
     st.info("발주할 품목을 체크하거나 기타 품목을 입력해주세요.")
