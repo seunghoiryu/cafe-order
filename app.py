@@ -12,15 +12,12 @@ from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 
-APP_DIR = os.path.dirname(os.path.abspath(__file__))
-ITEMS_PATH = os.path.join(APP_DIR, "items.csv")
-
 st.set_page_config(page_title="카페 발주 리스트", page_icon="☕", layout="wide")
 
-# ===== 비밀번호 설정 =====
-# 배포 후에는 Streamlit Cloud > Settings > Secrets 에서
-# APP_PASSWORD = "원하는비밀번호"
-# 형태로 저장하는 걸 추천합니다.
+SHEET_ID = "1HztR9CkmD2Y_URULXA9IK7DM8MHv57UWOEaej13N53A"
+SHEET_GID = "0"
+SHEET_CSV_URL = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/export?format=csv&gid={SHEET_GID}"
+
 DEFAULT_PASSWORD = "1234"
 APP_PASSWORD = st.secrets.get("APP_PASSWORD", DEFAULT_PASSWORD)
 
@@ -62,19 +59,34 @@ def safe_filename(text):
     text = re.sub(r"[^\w가-힣.-]+", "_", str(text))
     return text.strip("_")
 
-def load_items():
-    if not os.path.exists(ITEMS_PATH):
-        st.error("items.csv 파일이 없습니다.")
+@st.cache_data(ttl=60)
+def load_items_from_google_sheet():
+    try:
+        df = pd.read_csv(SHEET_CSV_URL)
+    except Exception as e:
+        st.error("구글시트를 불러오지 못했습니다. 시트 공유 설정을 확인해주세요.")
+        st.caption(str(e))
         st.stop()
-    df = pd.read_csv(ITEMS_PATH)
-    if not {"category", "item"}.issubset(df.columns):
-        st.error("items.csv에는 category, item 컬럼이 필요합니다.")
+
+    required_cols = {"category", "item", "active"}
+    if not required_cols.issubset(df.columns):
+        st.error("구글시트 첫 줄은 category, item, active 컬럼이어야 합니다.")
         st.stop()
+
+    df = df.fillna("")
+    df["category"] = df["category"].astype(str).str.strip()
+    df["item"] = df["item"].astype(str).str.strip()
+    df["active"] = df["active"].astype(str).str.upper().str.strip()
+
+    df = df[(df["category"] != "") & (df["item"] != "")]
+    df = df[df["active"].isin(["Y", "YES", "TRUE", "1", "사용"])]
+
+    if df.empty:
+        st.warning("표시할 품목이 없습니다. 구글시트의 active 값을 Y로 입력해주세요.")
     return df
 
 def make_pdf_bytes(order_date, staff_name, rows, memo):
     buffer = io.BytesIO()
-
     doc = SimpleDocTemplate(
         buffer,
         pagesize=A4,
@@ -137,15 +149,18 @@ def make_pdf_bytes(order_date, staff_name, rows, memo):
     return pdf_value
 
 st.title("☕ 카페 발주 리스트")
-st.caption("필요한 품목만 체크하고 수량 입력 후 PDF로 출력하세요.")
+st.caption("구글시트 품목표를 기준으로 불러옵니다. 품목 수정은 구글시트에서 하면 됩니다.")
 
-df = load_items()
+df = load_items_from_google_sheet()
 
 with st.sidebar:
     st.header("발주 정보")
     order_date = st.date_input("발주일", date.today())
     staff_name = st.text_input("작성자", placeholder="예: 김직원")
     st.divider()
+    if st.button("품목 새로고침"):
+        st.cache_data.clear()
+        st.rerun()
     if st.button("로그아웃"):
         st.session_state.login_ok = False
         st.rerun()
@@ -176,7 +191,6 @@ for category in df["category"].drop_duplicates():
 
 with st.expander("[기타] 리스트에 없는 품목 직접 입력", expanded=True):
     extra_count = st.number_input("기타 품목 개수", min_value=0, max_value=20, step=1, value=0)
-
     for i in range(int(extra_count)):
         c1, c2, c3 = st.columns([3, 1, 3])
         with c1:
