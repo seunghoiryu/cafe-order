@@ -25,7 +25,7 @@ SHEET_GID = "0"
 SHEET_CSV_URL = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/export?format=csv&gid={SHEET_GID}"
 
 # ===== 비밀번호 설정 =====
-DEFAULT_PASSWORD = "1234"
+DEFAULT_PASSWORD = "0928"
 APP_PASSWORD = st.secrets.get("APP_PASSWORD", DEFAULT_PASSWORD)
 
 # 이미지 생성용 한글 폰트: 서버 실행 시 임시 다운로드
